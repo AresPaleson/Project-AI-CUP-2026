@@ -1,0 +1,38 @@
+# === uv & Virtual Environments ===
+.venv/
+.rocks/
+bin/
+lib/
+include/
+share/
+
+# Don't push 2GB model weights to GitHub
+*.pt
+*.pth
+*.bin
+*.onnx
+*.ckpt
+*.h5
+*.weights
+models/
+data/
+dataset/
+
+# === Python Artifacts ===
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# === Environment & Secrets ===
+.env
+.venv
+env/
+venv/
+ENV/
+
+# === OS Specific ===
+.DS_Store
+Thumbs.db
