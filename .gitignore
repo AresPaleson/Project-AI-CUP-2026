@@ -6,7 +6,7 @@ lib/
 include/
 share/
 
-# Don't push 2GB model weights to GitHub
+# === Model Artifacts ===
 *.pt
 *.pth
 *.bin
