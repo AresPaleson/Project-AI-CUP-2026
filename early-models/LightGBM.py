@@ -111,18 +111,11 @@ def get_features(df):
 def main():
     print("Pipeline started...")
 
-    # 1. Load Data
     train = pd.read_csv("data/train.csv")
     test = pd.read_csv("data/test.csv")
 
-    # Sanity check
-    if 'airspeed' not in train.columns:
-        raise ValueError("'airspeed' column not found in train.csv. Check column names: " + str(train.columns.tolist()))
-
-    # 2. Feature Engineering
-    print("Extracting Train Features...")
+    print("Extracting Train and Test Features...")
     X_train_df = get_features(train)
-    print("Extracting Test Features...")
     X_test_df = get_features(test)
 
     X = X_train_df.drop(columns=['track_id'])
