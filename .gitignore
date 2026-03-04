@@ -14,9 +14,6 @@ share/
 *.ckpt
 *.h5
 *.weights
-models/
-data/
-dataset/
 
 # === Python Artifacts ===
 __pycache__/
