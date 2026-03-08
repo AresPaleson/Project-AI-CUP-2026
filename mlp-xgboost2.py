@@ -8,6 +8,7 @@ from sklearn.metrics import log_loss
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
+import lightgbm as lgb
 import logging
 
 # Set up logging
@@ -29,7 +30,7 @@ def decode_trajectory(hex_str):
 def get_features(df):
     feats = []
     logger.info(f"Processing {len(df)} rows...")
-    df = df.copy()  # Create a copy to avoid warnings
+    df = df.copy()
     df["ts"] = pd.to_datetime(df["timestamp_start_radar_utc"])
     if "timestamp_end_radar_utc" in df.columns:
         df["ts_end"] = pd.to_datetime(df["timestamp_end_radar_utc"])
@@ -47,55 +48,62 @@ def get_features(df):
         total_duration = times[-1] - times[0] if len(times) > 1 else 0
         airspeed = float(row.airspeed)
 
-        if len(coords) > 1:
-            lon1, lat1 = coords[:-1, 0], coords[:-1, 1]
-            lon2, lat2 = coords[1:, 0], coords[1:, 1]
-            seg_dist = haversine_vec(lon1, lat1, lon2, lat2)
-            path_length = np.sum(seg_dist)
-            displacement = haversine_vec(coords[0, 0], coords[0, 1], coords[-1, 0], coords[-1, 1])
-            inst_speed = seg_dist / dt_safe
-            dlon = np.radians(lon2 - lon1)
-            dlat = np.radians(lat2 - lat1)
-            headings = np.degrees(np.arctan2(dlon, dlat)) % 360
-            turn_angles = np.abs(np.diff(headings))
-            turn_angles = np.where(turn_angles > 180, 360 - turn_angles, turn_angles)
-            straightness = displacement / (path_length + 1e-9)
-            
-            # Rate of turn change
-            turn_rate = turn_angles / dt_safe[1:] if len(turn_angles) > 1 else np.array([0])
-            
-            # Energy metrics
-            potential_energy = altitudes * 9.81  # m^2/s^2
-            kinetic_energy = 0.5 * inst_speed**2
-            
-            # Trajectory efficiency
-            sinuosity = path_length / displacement if displacement > 0 else 0
-            
-            # Vertical acceleration
-            if len(altitudes) > 2:
-                dz2 = np.diff(altitudes, n=2)
-                vertical_accel = np.mean(dz2 / dt_safe[1:]**2) if len(dz2) > 0 else 0
-            else:
-                vertical_accel = 0
+        lon1, lat1 = coords[:-1, 0], coords[:-1, 1]
+        lon2, lat2 = coords[1:, 0], coords[1:, 1]
+        seg_dist = haversine_vec(lon1, lat1, lon2, lat2)
+        path_length = np.sum(seg_dist)
+        displacement = haversine_vec(coords[0, 0], coords[0, 1], coords[-1, 0], coords[-1, 1])
+        inst_speed = seg_dist / dt_safe
+        dlon = np.radians(lon2 - lon1)
+        dlat = np.radians(lat2 - lat1)
+        headings = np.degrees(np.arctan2(dlon, dlat)) % 360
+        turn_angles = np.abs(np.diff(headings))
+        turn_angles = np.where(turn_angles > 180, 360 - turn_angles, turn_angles)
+        straightness = displacement / (path_length + 1e-9)
+        
+        turn_rate = turn_angles / dt_safe[1:] if len(turn_angles) > 1 else np.array([0])
+        potential_energy = altitudes * 9.81
+        kinetic_energy = 0.5 * inst_speed**2
+        sinuosity = path_length / displacement if displacement > 0 else 0
+        
+        if len(altitudes) > 2:
+            dz2 = np.diff(altitudes, n=2)
+            vertical_accel = np.mean(dz2 / dt_safe[1:]**2) if len(dz2) > 0 else 0
         else:
-            path_length = displacement = 0
-            inst_speed = np.array([0])
-            turn_angles = np.array([0])
-            turn_rate = np.array([0])
-            straightness = 0
-            potential_energy = altitudes * 9.81
-            kinetic_energy = np.array([0])
-            sinuosity = 0
             vertical_accel = 0
 
         dz = np.diff(altitudes)
         hour = row.ts.hour + row.ts.minute / 60.0
         day_of_year = row.ts.timetuple().tm_yday
-        is_night = int(hour < 6 or hour > 20)
         meta_duration = (row.ts_end - row.ts).total_seconds() if pd.notna(row.ts_end) else 0
         min_z_meta = float(row.min_z) if hasattr(row, 'min_z') and pd.notna(row.min_z) else 0.0
         max_z_meta = float(row.max_z) if hasattr(row, 'max_z') and pd.notna(row.max_z) else 0.0
         radar_bird_size = str(row.radar_bird_size) if hasattr(row, 'radar_bird_size') and pd.notna(row.radar_bird_size) else "Unknown"
+
+        # --- NEW FEATURES ---
+        # Speed percentiles (capture outlier bursts of speed)
+        speed_p25 = np.percentile(inst_speed, 25)
+        speed_p75 = np.percentile(inst_speed, 75)
+        speed_iqr = speed_p75 - speed_p25
+
+        # Altitude range and percentiles
+        alt_range = max_z_meta - min_z_meta
+        alt_p25 = np.percentile(altitudes, 25)
+        alt_p75 = np.percentile(altitudes, 75)
+
+        # RCS percentiles (bird size signal)
+        rcs_min = np.min(rcs)
+        rcs_max = np.max(rcs)
+        rcs_range = rcs_max - rcs_min
+
+        # Circular time features (hour as sin/cos avoids discontinuity at midnight)
+        hour_sin = np.sin(2 * np.pi * hour / 24)
+        hour_cos = np.cos(2 * np.pi * hour / 24)
+        doy_sin = np.sin(2 * np.pi * day_of_year / 365)
+        doy_cos = np.cos(2 * np.pi * day_of_year / 365)
+
+        # Net vertical displacement
+        net_altitude_change = altitudes[-1] - altitudes[0]
 
         f = {
             "track_id": row.track_id,
@@ -103,23 +111,36 @@ def get_features(df):
             "total_duration": total_duration,
             "airspeed": airspeed,
             "hour": hour,
+            "hour_sin": hour_sin,
+            "hour_cos": hour_cos,
+            "doy_sin": doy_sin,
+            "doy_cos": doy_cos,
             "day_of_year": day_of_year,
-            "is_night": is_night,
             "meta_duration": meta_duration,
             "speed_mean": np.mean(inst_speed),
             "speed_std": np.std(inst_speed),
+            "speed_p25": speed_p25,
+            "speed_p75": speed_p75,
+            "speed_iqr": speed_iqr,
             "mean_turn": np.mean(turn_angles),
             "std_turn": np.std(turn_angles),
             "mean_turn_rate": np.mean(turn_rate),
             "std_turn_rate": np.std(turn_rate),
             "mean_alt": np.mean(altitudes),
             "alt_std": np.std(altitudes),
+            "alt_range": alt_range,
+            "alt_p25": alt_p25,
+            "alt_p75": alt_p75,
+            "net_altitude_change": net_altitude_change,
             "climb_rate_mean": np.mean(dz / dt_safe) if len(dz) > 0 else 0,
             "vertical_accel": vertical_accel,
             "min_z_meta": min_z_meta,
             "max_z_meta": max_z_meta,
             "mean_rcs": np.mean(rcs),
             "rcs_std": np.std(rcs),
+            "rcs_min": rcs_min,
+            "rcs_max": rcs_max,
+            "rcs_range": rcs_range,
             "path_length": path_length,
             "displacement": displacement,
             "straightness": straightness,
@@ -131,14 +152,10 @@ def get_features(df):
         feats.append(f)
     
     df_feats = pd.DataFrame(feats)
-    
-    # Handle infinite values
     df_feats = df_feats.replace([np.inf, -np.inf], np.nan)
-    
     return df_feats
 
 def train_mlp(X, Y, groups, X_test, le, skf):
-    """Train MLP model and return predictions"""
     logger.info("\n" + "="*50)
     logger.info("Training MLP Classifier")
     logger.info("="*50)
@@ -146,7 +163,6 @@ def train_mlp(X, Y, groups, X_test, le, skf):
     oof = np.zeros((len(X), len(le.classes_)))
     test_preds = np.zeros((len(X_test), len(le.classes_)))
 
-    # Use best architecture from previous run
     best_arch = (128, 64)
     logger.info(f"Using architecture: {best_arch}")
 
@@ -155,7 +171,6 @@ def train_mlp(X, Y, groups, X_test, le, skf):
         X_tr, y_tr = X.iloc[train_idx], Y[train_idx]
         X_va, y_va = X.iloc[val_idx], Y[val_idx]
 
-        # Scale within fold
         scaler = StandardScaler()
         X_tr_scaled = scaler.fit_transform(X_tr)
         X_va_scaled = scaler.transform(X_va)
@@ -181,11 +196,9 @@ def train_mlp(X, Y, groups, X_test, le, skf):
 
     final_score = log_loss(Y, oof)
     logger.info(f"MLP CV LogLoss: {final_score:.4f}")
-    
     return test_preds, final_score
 
 def train_xgboost(X, Y, groups, X_test, le, skf):
-    """Train XGBoost model and return predictions"""
     logger.info("\n" + "="*50)
     logger.info("Training XGBoost Classifier")
     logger.info("="*50)
@@ -193,7 +206,6 @@ def train_xgboost(X, Y, groups, X_test, le, skf):
     oof = np.zeros((len(X), len(le.classes_)))
     test_preds = np.zeros((len(X_test), len(le.classes_)))
 
-    # XGBoost parameters (tuned for multi-class)
     params = {
         'objective': 'multi:softprob',
         'num_class': len(le.classes_),
@@ -213,8 +225,6 @@ def train_xgboost(X, Y, groups, X_test, le, skf):
         logger.info(f"Fold {fold+1}")
         X_tr, y_tr = X.iloc[train_idx], Y[train_idx]
         X_va, y_va = X.iloc[val_idx], Y[val_idx]
-
-        # XGBoost doesn't require scaling, but we'll use the data as is
         
         dtrain = xgb.DMatrix(X_tr, label=y_tr)
         dvalid = xgb.DMatrix(X_va, label=y_va)
@@ -234,27 +244,76 @@ def train_xgboost(X, Y, groups, X_test, le, skf):
 
     final_score = log_loss(Y, oof)
     logger.info(f"XGBoost CV LogLoss: {final_score:.4f}")
+    return test_preds, final_score
+
+def train_lightgbm(X, Y, groups, X_test, le, skf):
+    """Train LightGBM model and return predictions"""
+    logger.info("\n" + "="*50)
+    logger.info("Training LightGBM Classifier")
+    logger.info("="*50)
     
+    oof = np.zeros((len(X), len(le.classes_)))
+    test_preds = np.zeros((len(X_test), len(le.classes_)))
+
+    params = {
+        'objective': 'multiclass',
+        'num_class': len(le.classes_),
+        'metric': 'multi_logloss',
+        'num_leaves': 63,           # More leaves = more complex trees (XGB uses max_depth=6 ~ 63 leaves)
+        'learning_rate': 0.05,      # Lower than XGB — LightGBM converges well with more rounds
+        'feature_fraction': 0.8,    # Same as XGB colsample_bytree
+        'bagging_fraction': 0.8,    # Same as XGB subsample
+        'bagging_freq': 1,          # Required for bagging to activate
+        'min_child_samples': 20,    # Regularization: min samples per leaf
+        'reg_alpha': 0.1,
+        'reg_lambda': 1.0,
+        'verbose': -1,
+        'seed': 42,
+        'n_jobs': -1
+    }
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, Y, groups)):
+        logger.info(f"Fold {fold+1}")
+        X_tr, y_tr = X.iloc[train_idx], Y[train_idx]
+        X_va, y_va = X.iloc[val_idx], Y[val_idx]
+
+        dtrain = lgb.Dataset(X_tr, label=y_tr)
+        dvalid = lgb.Dataset(X_va, label=y_va, reference=dtrain)
+
+        callbacks = [
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=-1)  # Suppress per-round output
+        ]
+
+        model = lgb.train(
+            params,
+            dtrain,
+            num_boost_round=1000,
+            valid_sets=[dvalid],
+            callbacks=callbacks
+        )
+
+        oof[val_idx] = model.predict(X_va)
+        test_preds += model.predict(X_test) / skf.n_splits
+
+    final_score = log_loss(Y, oof)
+    logger.info(f"LightGBM CV LogLoss: {final_score:.4f}")
     return test_preds, final_score
 
 def main():
     logger.info("Pipeline started...")
 
-    # Load data
     train = pd.read_csv("data/train.csv")
     test  = pd.read_csv("data/test.csv")
 
-    # Extract features
     logger.info("Extracting features...")
     X_train_df = get_features(train)
     X_test_df  = get_features(test)
 
-    # Fill NaN values with column means
     for df in [X_train_df, X_test_df]:
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
 
-    # Encode categorical features
     logger.info("Encoding categorical features...")
     le_size = LabelEncoder()
     all_sizes = pd.concat([X_train_df["radar_bird_size"], X_test_df["radar_bird_size"]])
@@ -262,14 +321,12 @@ def main():
     X_train_df["radar_bird_size"] = le_size.transform(X_train_df["radar_bird_size"])
     X_test_df["radar_bird_size"]  = le_size.transform(X_test_df["radar_bird_size"])
 
-    # Prepare data
     X = X_train_df.drop(columns=["track_id"])
     X_test = X_test_df.drop(columns=["track_id"])
     le = LabelEncoder()
     Y = le.fit_transform(train["bird_group"])
     groups = X_train_df["track_id"]
 
-    # Feature importance analysis
     logger.info("Analyzing feature importance...")
     temp_scaler = StandardScaler()
     X_temp_scaled = temp_scaler.fit_transform(X.fillna(0))
@@ -280,47 +337,36 @@ def main():
         'importance': rf.feature_importances_
     }).sort_values('importance', ascending=False)
     logger.info(f"\nTop 10 features:\n{importance.head(10).to_string(index=False)}")
-    
-    # Save feature importance
     importance.to_csv("data/feature_importance.csv", index=False)
-    logger.info("Feature importance saved as feature_importance.csv")
 
-    # Cross-validation setup
     skf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
 
-    # Train MLP
-    mlp_preds, mlp_score = train_mlp(X, Y, groups, X_test, le, skf)
-    
-    # Train XGBoost
-    xgb_preds, xgb_score = train_xgboost(X, Y, groups, X_test, le, skf)
+    # Train all models
+    mlp_preds, mlp_score   = train_mlp(X, Y, groups, X_test, le, skf)
+    xgb_preds, xgb_score   = train_xgboost(X, Y, groups, X_test, le, skf)
+    lgbm_preds, lgbm_score = train_lightgbm(X, Y, groups, X_test, le, skf)
 
-    # Create submission files
     logger.info("\n" + "="*50)
     logger.info("Creating submission files")
     logger.info("="*50)
-    
-    # MLP submission
-    result_mlp = pd.DataFrame(mlp_preds, columns=le.classes_)
-    result_mlp.insert(0, "track_id", X_test_df["track_id"])
-    result_mlp.to_csv("data/submission_mlp.csv", index=False)
-    logger.info(f"MLP submission saved as submission_mlp.csv (CV LogLoss: {mlp_score:.4f})")
-    
-    # XGBoost submission
-    result_xgb = pd.DataFrame(xgb_preds, columns=le.classes_)
-    result_xgb.insert(0, "track_id", X_test_df["track_id"])
-    result_xgb.to_csv("data/submission_xgboost.csv", index=False)
-    logger.info(f"XGBoost submission saved as submission_xgboost.csv (CV LogLoss: {xgb_score:.4f})")
-    
-    # Summary
+
+    def save_submission(preds, name, score=None):
+        result = pd.DataFrame(preds, columns=le.classes_)
+        result.insert(0, "track_id", X_test_df["track_id"])
+        result.to_csv(f"data/submission_{name}.csv", index=False)
+        score_str = f" (CV LogLoss: {score:.4f})" if score else ""
+        logger.info(f"{name} submission saved{score_str}")
+
+    save_submission(mlp_preds,      "mlp",      mlp_score)
+    save_submission(xgb_preds,      "xgboost",  xgb_score)
+    save_submission(lgbm_preds,     "lightgbm", lgbm_score)
+
     logger.info("\n" + "="*50)
     logger.info("SUMMARY")
     logger.info("="*50)
-    logger.info(f"MLP CV LogLoss: {mlp_score:.4f}")
-    logger.info(f"XGBoost CV LogLoss: {xgb_score:.4f}")
-    logger.info("Two submission files created:")
-    logger.info("  - submission_mlp.csv")
-    logger.info("  - submission_xgboost.csv")
-
+    logger.info(f"MLP      CV LogLoss: {mlp_score:.4f}")
+    logger.info(f"XGBoost  CV LogLoss: {xgb_score:.4f}")
+    logger.info(f"LightGBM CV LogLoss: {lgbm_score:.4f}")
 
 if __name__ == "__main__":
     main()
