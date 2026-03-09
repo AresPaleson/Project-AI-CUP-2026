@@ -4,7 +4,8 @@ import numpy as np
 from shapely import wkb
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import log_loss
+from sklearn.metrics import average_precision_score
+from sklearn.preprocessing import label_binarize
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import RandomForestClassifier
 import logging
@@ -48,6 +49,11 @@ def get_features(df):
 
         lon1, lat1 = coords[:-1, 0], coords[:-1, 1]
         lon2, lat2 = coords[1:, 0], coords[1:, 1]
+
+        rcs_max = np.max(rcs) if len(rcs) > 0 else 0
+        rcs_diff = np.abs(np.diff(rcs))
+        mean_rcs_change = np.mean(rcs_diff) if len(rcs_diff) > 0 else 0
+
         seg_dist = haversine_vec(lon1, lat1, lon2, lat2)
         path_length = np.sum(seg_dist)
         displacement = haversine_vec(coords[0, 0], coords[0, 1], coords[-1, 0], coords[-1, 1])
@@ -106,6 +112,8 @@ def get_features(df):
             "max_z_meta": max_z_meta,
             "mean_rcs": np.mean(rcs),
             "rcs_std": np.std(rcs),
+            "rcs_max": rcs_max,                  # <-- NEW
+            "mean_rcs_change": mean_rcs_change,  # <-- NEW
             "path_length": path_length,
             "displacement": displacement,
             "straightness": straightness,
@@ -196,8 +204,9 @@ def main():
         oof[val_idx] = model.predict_proba(X_va_scaled)
         test_preds += model.predict_proba(X_test_scaled_fold) / skf.n_splits
 
-    final_score = log_loss(Y, oof)
-    logger.info(f"\nFinal CV LogLoss: {final_score:.4f}")
+    Y_bin = label_binarize(Y, classes=range(len(le.classes_)))
+    final_score = average_precision_score(Y_bin, oof, average="weighted")
+    logger.info(f"\nFinal CV Average Precision (Weighted): {final_score:.4f}")
 
     # Create submission
     result = pd.DataFrame(test_preds, columns=le.classes_)
